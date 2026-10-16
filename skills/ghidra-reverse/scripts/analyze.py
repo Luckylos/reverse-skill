@@ -10,6 +10,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 
 class Once(argparse.Action):
@@ -60,6 +61,26 @@ def launcher_path(explicit):
     if not path.is_file() or not os.access(path, os.X_OK):
         raise ValueError('launcher is not an executable regular file')
     return str(path)
+
+
+def require_nonreaping_wait():
+    if not all(hasattr(os, name) for name in ('waitid', 'P_PID', 'WEXITED', 'WNOWAIT', 'WNOHANG')):
+        raise ValueError('os.waitid with WEXITED/WNOWAIT/WNOHANG is required for safe '
+                         'process-group cleanup; unsupported platform')
+
+
+def wait_unreaped(pid, deadline):
+    """Return True once pid has exited, False at the deadline; never reaps it.
+
+    The unreaped (zombie) leader keeps its PID, and thus its process-group ID, from being reused.
+    """
+    while True:
+        if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
 
 
 def validate_report(path, expected_digest, config):
@@ -132,6 +153,7 @@ def main():
     try:
         if os.name != 'posix':
             raise ValueError('only POSIX launchers are supported; native Windows is unsupported')
+        require_nonreaping_wait()
         if not args.authorized:
             raise ValueError('explicit input/action/output authorization required (--authorized)')
         source = Path(args.input).expanduser().absolute()
@@ -165,21 +187,36 @@ def main():
                    '-analysisTimeoutPerFile', str(args.analysis_timeout), '-scriptPath', str(resources),
                    '-scriptlog', str(output / 'script.log'), '-log', str(output / 'headless.log'),
                    '-postScript', 'ExportAnalysis.java', str(config_path)]
+        # An inherited SIG_IGN would auto-reap the launcher, losing its status and PID/PGID ownership.
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         with (output / 'console.log').open('wb') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
                                        shell=False, start_new_session=True)
+            deadline = time.monotonic() + args.timeout
+            interrupted = None
+            pinned = True
             try:
-                code = process.wait(timeout=args.timeout)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-                print('Analysis interrupted/timed out; process group killed; diagnostics retained.', file=sys.stderr)
-                return 124 if isinstance(error, subprocess.TimeoutExpired) else 130
-            finally:
-                # The launcher may exit before its same-group descendants.
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
+                    if not wait_unreaped(process.pid, deadline):
+                        interrupted = 124
+                except KeyboardInterrupt:
+                    interrupted = 130
+                except ChildProcessError:
+                    pinned = False  # reaped elsewhere: the number no longer identifies our group
+                    raise ValueError('launcher was reaped externally; process group not signalled')
+            finally:
+                # The launcher may exit before its same-group descendants. It is still unreaped
+                # here, so its PID/PGID cannot have been reused; reap exactly once afterwards and
+                # never signal that number again.
+                if pinned:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                code = process.wait()
+            if interrupted:
+                print('Analysis interrupted/timed out; process group killed; diagnostics retained.', file=sys.stderr)
+                return interrupted
         if digest(source) != expected_digest:
             raise ValueError('input changed during analysis')
         if code != 0:

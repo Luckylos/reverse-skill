@@ -1,23 +1,122 @@
 """Offline contract tests. Generated binaries are analyzed, never executed."""
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
+from unittest import mock
+import uuid
 
 SKILL = Path(__file__).resolve().parents[1]
 SCRIPT = SKILL / 'scripts/analyze.py'
 SCRATCH = Path(os.environ.get('GHIDRA_TEST_SCRATCH', str(SKILL.parents[2])))
+PROC = Path('/proc')
+# Above Linux PID_MAX_LIMIT (2**22): never a live process even if a mock were bypassed.
+FAKE_PID = 2 ** 22 + 4242
+
+
+def pidfd_exited(fd):
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+def kill_verified_child(pid_file, marker, proc=PROC):
+    """SIGKILL the controlled fixture child only through a pidfd proven to carry marker.
+
+    The pidfd pins one process. If it is live both before and after reading /proc/<pid>/cmdline,
+    that PID named the pinned process throughout, so the marker belongs to it. Gone, zombie,
+    reused, unreadable, or exited-during-check processes are never signalled; there is no
+    numeric kill fallback. Returns True only when the owned child was signalled.
+    """
+    try:
+        pid = int(pid_file.read_text())
+        fd = os.pidfd_open(pid)
+    except (OSError, ValueError):
+        return False
+    try:
+        if pidfd_exited(fd):
+            return False
+        try:
+            argv = (proc / str(pid) / 'cmdline').read_bytes().split(b'\0')
+        except OSError:
+            return False
+        if marker is None or marker.encode() not in argv or pidfd_exited(fd):
+            return False
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+        return True
+    finally:
+        os.close(fd)
+
+
+def child_gone(pid_file, attempts=40):
+    """Read-only /proc polling: True once the recorded child is absent or a zombie."""
+    pid = int(pid_file.read_text())
+    for _ in range(attempts):
+        try:
+            if (PROC / str(pid) / 'stat').read_text().split()[2] == 'Z':
+                return True
+        except FileNotFoundError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def load_analyze():
+    spec = importlib.util.spec_from_file_location('ghidra_analyze_under_test', SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    previous, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+def fixture_report(source, config):
+    return {'schema_version': 1, 'complete': True,
+            'sample_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+            'ghidra_version': 'fixture', 'program': source.name, 'language': 'x86:LE:64:default',
+            'analysis_timed_out': False, 'unmatched_selectors': [],
+            'selectors': config['selectors'], 'limits': config['limits'],
+            'functions_truncated': False, 'functions': [
+                {'name': 'target', 'address': '00101000', 'status': 'ok', 'c': 'int target(void) { return 1; }',
+                 'xrefs_truncated': False, 'xrefs': []}]}
+
+
+class FakePoll:
+    """select.poll stand-in replaying pidfd readiness: True means POLLIN (process exited)."""
+    def __init__(self, script):
+        self.script = script
+        self.fd = None
+
+    def register(self, fd, events):
+        assert events & select.POLLIN
+        self.fd = fd
+
+    def poll(self, timeout=None):
+        return [(self.fd, select.POLLIN)] if self.script.pop(0) else []
 
 
 class AnalyzeTests(unittest.TestCase):
     def setUp(self):
+        # Cleanup of controlled fixture children needs a stable pidfd identity; fail, never skip.
+        self.assertTrue(PROC.joinpath('self/cmdline').is_file() and hasattr(os, 'pidfd_open')
+                        and hasattr(signal, 'pidfd_send_signal') and hasattr(select, 'poll'),
+                        'Linux /proc, os.pidfd_open, signal.pidfd_send_signal and select.poll required')
+        os.close(os.pidfd_open(os.getpid()))
+        self.marker = None
         self.temp = tempfile.TemporaryDirectory(prefix='contract ', dir=SCRATCH)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -31,13 +130,14 @@ args = sys.argv[1:]
 out = pathlib.Path(args[0]).parent
 (out / 'argv.json').write_text(json.dumps(args))
 mode = os.environ.get('FAKE_MODE', 'valid')
+marker = os.environ['FAKE_MARKER']
 if mode.startswith('early-'):
     mode = mode.removeprefix('early-')
     child = subprocess.Popen([sys.executable, '-c',
         'import os, pathlib, signal, sys, time; '
         'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
         'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)',
-        str(out / 'child.pid')])
+        str(out / 'child.pid'), marker])
     deadline = time.monotonic() + 5
     while not (out / 'child.pid').exists():
         if child.poll() is not None or time.monotonic() >= deadline:
@@ -47,7 +147,7 @@ if mode.startswith('early-'):
         time.sleep(0.01)
 if mode == 'fail': sys.exit(9)
 if mode == 'timeout':
-    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', marker])
     (out / 'child.pid').write_text(str(child.pid))
     time.sleep(60)
 if mode == 'missing': sys.exit(0)
@@ -79,17 +179,21 @@ if mode == 'oversizedc': report['functions'][0]['c'] = 'x' * 100001
 if mode == 'noxrefmarker': del report['functions'][0]['xrefs_truncated']
 if mode == 'mutate': source.write_bytes(b'changed')
 (out / 'analysis.json').write_text(json.dumps(report))
+if mode == 'validfail': sys.exit(9)
 ''')
         self.fake.chmod(0o700)
 
-    def run_cli(self, *extra, mode='valid', auth=True, launcher=None):
+    def run_cli(self, *extra, mode='valid', auth=True, launcher=None, preexec_fn=None):
         env = os.environ.copy()
         env['FAKE_MODE'] = mode
+        # Unique argv marker for the controlled fixture child; cleanup verifies it before signalling.
+        self.marker = env['FAKE_MARKER'] = 'ghidra-fixture-child-' + uuid.uuid4().hex
         args = [sys.executable, str(SCRIPT), str(self.sample), '--output', str(self.out),
                 '--launcher', str(launcher or self.fake)]
         if auth:
             args.append('--authorized')
-        return subprocess.run(args + list(extra), env=env, capture_output=True, text=True, timeout=240)
+        return subprocess.run(args + list(extra), env=env, capture_output=True, text=True, timeout=240,
+                              preexec_fn=preexec_fn)
 
     def test_safe_argv_private_output_and_unchanged_input(self):
         before = self.sample.read_bytes()
@@ -163,6 +267,7 @@ if mode == 'mutate': source.write_bytes(b'changed')
         env.pop('GHIDRA_HEADLESS', None)
         env.pop('GHIDRA_HOME', None)
         env['FAKE_MODE'] = 'valid'
+        env['FAKE_MARKER'] = 'ghidra-fixture-child-' + uuid.uuid4().hex
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
         (bin_dir / 'ghidra-headless').symlink_to(self.fake)
@@ -195,6 +300,7 @@ if mode == 'mutate': source.write_bytes(b'changed')
         for mode, expected in [('valid', 0), ('fail', 1), ('malformed', 1), ('mutate', 1)]:
             with self.subTest(mode=mode):
                 self.out = self.root / ('early-' + mode)
+                gone = False
                 try:
                     result = self.run_cli(mode='early-' + mode)
                     self.assertEqual(result.returncode, expected, result.stderr)
@@ -203,33 +309,217 @@ if mode == 'mutate': source.write_bytes(b'changed')
                         status = Path('/proc') / str(pid) / 'stat'
                         try:
                             if status.read_text().split()[2] == 'Z':
+                                gone = True
                                 break
                         except FileNotFoundError:
+                            gone = True
                             break
                         time.sleep(0.05)
                     else:
                         self.fail('launcher descendant remains running after early ' + mode)
                 finally:
-                    # RED must not leak the controlled orphan when cleanup is missing.
-                    pid_file = self.out / 'child.pid'
-                    if pid_file.exists():
-                        try:
-                            os.kill(int(pid_file.read_text()), signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                    # RED must not leak the controlled orphan when cleanup is missing; once it is
+                    # confirmed gone its number is never signalled again.
+                    if not gone:
+                        kill_verified_child(self.out / 'child.pid', self.marker)
 
     def test_timeout_kills_child_process_group(self):
-        result = self.run_cli('--timeout', '2', mode='timeout')
-        self.assertEqual(result.returncode, 124, result.stderr)
-        pid = int((self.out / 'child.pid').read_text())
-        for _ in range(40):
-            status = Path('/proc') / str(pid) / 'stat'
-            if not status.exists() or status.read_text().split()[2] == 'Z':
-                break
-            time.sleep(0.05)
-        else:
-            self.fail('launcher descendant remains running')
-        self.assertTrue((self.out / 'console.log').exists())
+        gone = False
+        try:
+            result = self.run_cli('--timeout', '2', mode='timeout')
+            self.assertEqual(result.returncode, 124, result.stderr)
+            pid = int((self.out / 'child.pid').read_text())
+            for _ in range(40):
+                status = Path('/proc') / str(pid) / 'stat'
+                if not status.exists() or status.read_text().split()[2] == 'Z':
+                    gone = True
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail('launcher descendant remains running')
+            self.assertTrue((self.out / 'console.log').exists())
+        finally:
+            if not gone:
+                kill_verified_child(self.out / 'child.pid', self.marker)
+
+    def test_inherited_ignored_sigchld_keeps_launcher_identity(self):
+        # SIG_IGN for SIGCHLD auto-reaps the launcher: its status is lost and its PID/PGID may be reused.
+        def ignore_sigchld():
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        for mode, expected in [('valid', 0), ('validfail', 1)]:
+            with self.subTest(mode=mode):
+                self.out = self.root / ('ignored-sigchld-' + mode)
+                gone = False
+                try:
+                    result = self.run_cli(mode='early-' + mode, preexec_fn=ignore_sigchld)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected:
+                        self.assertIn('launcher failed (9)', result.stderr)
+                    gone = child_gone(self.out / 'child.pid')
+                    self.assertTrue(gone, 'launcher descendant remains running with inherited SIG_IGN')
+                finally:
+                    if not gone:
+                        kill_verified_child(self.out / 'child.pid', self.marker)
+
+    def test_launcher_never_reaped_before_group_kill_nor_signalled_after(self):
+        analyze = load_analyze()
+        expectations = {'valid': 0, 'fail': 1, 'missing': 1, 'mutate': 1, 'timeout': 124,
+                        'interrupt': 130, 'observe-error': RuntimeError}
+        for scenario, expected in expectations.items():
+            with self.subTest(scenario=scenario):
+                self.sample.write_bytes(b'owned offline fixture')
+                self.out = self.root / ('order-' + scenario)
+                events, kills = [], []
+                exit_code = {'valid': 0, 'missing': 0, 'mutate': 0, 'fail': 9}.get(scenario, -9)
+                sample = self.sample
+
+                def observe(reaping):
+                    events.append('reap' if reaping else 'observe')
+                    if scenario == 'interrupt':
+                        raise KeyboardInterrupt
+                    if scenario == 'observe-error':
+                        raise RuntimeError('observation failed')
+                    return scenario != 'timeout'
+
+                class Launcher:
+                    pid = FAKE_PID
+                    returncode = None
+
+                    def wait(self, timeout=None):
+                        if timeout is not None and not observe(True):
+                            raise subprocess.TimeoutExpired('fake launcher', timeout)
+                        if timeout is None:
+                            events.append('reap')
+                        self.returncode = exit_code
+                        return exit_code
+
+                    def poll(self):
+                        events.append('reap')
+                        self.returncode = exit_code
+                        return exit_code
+
+                def popen(command, **kwargs):
+                    self.assertIs(kwargs.get('shell'), False)
+                    self.assertIs(kwargs.get('start_new_session'), True)
+                    events.append('spawn')
+                    config_path = Path(command[command.index('-postScript') + 2])
+                    config = json.loads(config_path.read_text())
+                    if scenario == 'valid':
+                        Path(config['output']).write_text(json.dumps(fixture_report(sample, config)))
+                    if scenario == 'mutate':
+                        sample.write_bytes(b'changed')
+                    return Launcher()
+
+                def waitid(idtype, pid, options):
+                    self.assertEqual((idtype, pid), (os.P_PID, FAKE_PID))
+                    required = os.WEXITED | os.WNOWAIT | os.WNOHANG
+                    if not observe(options & required != required):
+                        return None
+                    return types.SimpleNamespace(si_pid=FAKE_PID, si_code=os.CLD_EXITED, si_status=exit_code)
+
+                def waitpid(pid, options):
+                    events.append('reap')
+                    return pid, (exit_code & 0xff) << 8
+
+                def killpg(pgid, sig):
+                    events.append('killpg')
+                    kills.append((pgid, sig))
+
+                def set_handler(signum, handler):
+                    if signum == signal.SIGCHLD:
+                        events.append('sigchld-default' if handler == signal.SIG_DFL else 'sigchld-other')
+                    return signal.SIG_DFL
+
+                argv = ['analyze.py', str(self.sample), '--output', str(self.out), '--authorized',
+                        '--launcher', str(self.fake), '--timeout', '1']
+                stderr = io.StringIO()
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(subprocess, 'Popen', popen), \
+                        mock.patch.object(os, 'waitid', waitid), \
+                        mock.patch.object(os, 'waitpid', waitpid), \
+                        mock.patch.object(os, 'killpg', killpg), \
+                        mock.patch.object(os, 'kill', side_effect=AssertionError('numeric kill')), \
+                        mock.patch.object(signal, 'signal', set_handler), \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    if expected is RuntimeError:
+                        with self.assertRaises(RuntimeError):
+                            analyze.main()
+                    else:
+                        self.assertEqual(analyze.main(), expected, stderr.getvalue())
+                self.assertEqual(kills, [(FAKE_PID, signal.SIGKILL)], events)
+                self.assertEqual(events.count('reap'), 1, events)
+                self.assertLess(events.index('killpg'), events.index('reap'), events)
+                self.assertIn('sigchld-default', events)
+                self.assertLess(events.index('sigchld-default'), events.index('spawn'), events)
+                self.assertTrue((self.out / 'console.log').exists())
+
+    def test_missing_nonreaping_wait_support_fails_before_output(self):
+        analyze = load_analyze()
+        for name in ('waitid', 'WNOWAIT', 'WNOHANG'):
+            with self.subTest(name=name):
+                self.out = self.root / ('unsupported-' + name)
+                argv = ['analyze.py', str(self.sample), '--output', str(self.out), '--authorized',
+                        '--launcher', str(self.fake)]
+                stderr = io.StringIO()
+                saved = getattr(os, name)
+                delattr(os, name)
+                try:
+                    with mock.patch.object(sys, 'argv', argv), \
+                            mock.patch.object(subprocess, 'Popen', side_effect=AssertionError('spawned')), \
+                            contextlib.redirect_stderr(stderr):
+                        code = analyze.main()
+                finally:
+                    setattr(os, name, saved)
+                self.assertEqual(code, 1)
+                self.assertIn('waitid', stderr.getvalue())
+                self.assertFalse(self.out.exists())
+
+    def test_fixture_cleanup_signals_only_verified_owned_child_via_pidfd(self):
+        marker = 'ghidra-fixture-child-' + uuid.uuid4().hex
+        proc = self.root / 'fake proc'
+        (proc / str(FAKE_PID)).mkdir(parents=True)
+        cmdline = proc / str(FAKE_PID) / 'cmdline'
+        mine = b'\0'.join([b'python3', b'-c', b'sleep', b'child.pid', marker.encode()]) + b'\0'
+        other = mine.replace(marker.encode(), b'ghidra-fixture-child-' + uuid.uuid4().hex.encode())
+        # name: (pid file text, pidfd_open outcome, pidfd exited per poll, cmdline bytes or None, signalled)
+        cases = {
+            'gone': (str(FAKE_PID), ProcessLookupError(), [], mine, False),
+            'malformed-pid-file': ('12ab', 777, [], mine, False),
+            'zombie': (str(FAKE_PID), 777, [True], b'', False),
+            'reused-other-marker': (str(FAKE_PID), 777, [False], other, False),
+            'unreadable': (str(FAKE_PID), 777, [False], None, False),
+            'exited-during-check': (str(FAKE_PID), 777, [False, True], mine, False),
+            'owned': (str(FAKE_PID), 777, [False, False], mine, True),
+        }
+        for name, (pid_text, opened, exits, content, signalled) in cases.items():
+            with self.subTest(case=name):
+                pid_file = self.root / 'child.pid'
+                pid_file.write_text(pid_text)
+                if content is None:
+                    cmdline.unlink(missing_ok=True)
+                else:
+                    cmdline.write_bytes(content)
+                polls = list(exits)
+                pidfd_open = mock.Mock(side_effect=[opened])
+                with mock.patch.object(os, 'pidfd_open', pidfd_open), \
+                        mock.patch.object(select, 'poll', lambda: FakePoll(polls)), \
+                        mock.patch.object(os, 'close') as close, \
+                        mock.patch.object(os, 'kill') as kill, \
+                        mock.patch.object(os, 'killpg') as killpg, \
+                        mock.patch.object(signal, 'pidfd_send_signal') as send:
+                    result = kill_verified_child(pid_file, marker, proc=proc)
+                kill.assert_not_called()
+                killpg.assert_not_called()
+                self.assertIs(result, signalled)
+                if signalled:
+                    send.assert_called_once_with(777, signal.SIGKILL)
+                else:
+                    send.assert_not_called()
+                if pidfd_open.called and not isinstance(opened, Exception):
+                    close.assert_called_once_with(777)
+                else:
+                    close.assert_not_called()
+                self.assertEqual(polls, [], 'unexpected pidfd liveness poll count')
 
     def test_real_decompilation_selection_and_xref_bounds(self):
         self.assertTrue(SCRIPT.exists(), 'wrapper not implemented')
