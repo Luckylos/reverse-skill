@@ -1,5 +1,5 @@
 ---
-name: reverse-skill-router
+name: reverse-skills-index
 description: Routes reverse engineering, exploitation, penetration testing, malware, mobile, firmware, browser automation, documentation, and security tasks to the appropriate specialist skill. Use when a task spans modules or the correct reverse-skill entrypoint is unclear.
 ---
 # Reverse Engineering Skills Master Control
