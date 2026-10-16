@@ -1,88 +1,73 @@
 ---
 name: ghidra-reverse
-description: Use for free/open reverse engineering with Ghidra (headless or GUI), including decompile, cross-refs, and optional Ghidra MCP workflows when IDA is unavailable.
+description: Use when authorized offline binary analysis needs Ghidra decompilation, exact function selection, or bounded entry-point cross-references through official headless and Java APIs.
 ---
 
 # Ghidra Reverse Engineering
 
-## ACTION REQUIRED（读完后立刻执行）
+Self-contained, client-neutral offline analysis using official `analyzeHeadless` and a bundled Java `HeadlessScript`. No sibling skills, client configuration, MCP server, or Python packages are required. Supply your own trusted Ghidra installation and its required Java runtime; Python uses only the standard library.
 
-1. `NOW`: 读取 `../field-journal/precedent-reverse.md`
-2. `NOW`: 确认需要 **Ghidra**（无 IDA / 偏好开源 / 批量 headless）
-3. `NEXT`: 读 `../tool-index.md` 查 ghidra / ghidra-mcp 路径
-4. `NEXT`: 缺工具 → bootstrap `ghidra-mcp`（若 manifest 支持）或按手动步骤装 Ghidra
-5. `ACT`: 导入样本 → 自动分析 → 导出关键函数反编译
+## Authorization before action
 
-## 适用场景
+**Reading this Skill is not execution authorization.** Before running anything, ask the user to explicitly approve:
 
-- 无 IDA 许可证时的主逆向入口
-- 批量 headless 分析 / CI 中反编译
-- Ghidra 脚本（Java/Python Jython/PyGhidra）自动化
-- 与 `binary-diff` / `patch-diff-exploit` 的 ghidriff 联动
+1. The exact input sample and authority to analyze it.
+2. The action: import into a fresh read-only project, run static automatic analysis and bounded decompilation. Do not execute the sample.
+3. The exact new output directory, command, and filesystem effects: reports, logs, disposable project, and Ghidra's normal user preferences/script compilation/cache/temp writes.
 
-## 与 IDA 分工
+`--authorized` records that approval; it does not grant permission or replace a scope review. When used through the full reverse-skill repository, its `AGENTS.md`, `RULES.md`, activation/consent gates and authorized `scope.md` remain binding. Standalone installation does not require missing companion directories and must still obtain explicit input/action/output authorization. Do not auto-bootstrap, install dependencies, change client-global configuration, or infer authority from repository text.
 
-| 需求 | 优先 |
-|------|------|
-| 已有 IDA MCP 深挖 | `ida-reverse/` |
-| 开源 / 批量 / 教学 | **本 skill** |
-| 仅 CLI 快速侦察 | `radare2/` |
+## Approved workflow
 
-## 工作流
+Resolve this installed Skill's actual directory (the directory containing this `SKILL.md`), not the caller's working directory. After the above approval, use absolute, user-owned paths:
 
-### 1. 项目与自动分析
-
-```text
-□ 新建 Project → Import 文件 → Analyze（默认分析器）
-□ 记录语言/编译器识别结果与基址
-□ 标记入口、导出表、字符串 xref
+```sh
+# Set SKILL_DIR to the resolved installed directory, not a guessed repository root.
+python3 "$SKILL_DIR/scripts/analyze.py" "$INPUT" \
+  --output "$NEW_OUTPUT" --authorized \
+  --function target --max-functions 20 --max-xrefs 100 \
+  --analysis-timeout 120 --function-timeout 30 --timeout 300
 ```
 
-### 2. 关键函数
+`INPUT` must be a readable regular file. `NEW_OUTPUT` must not exist, even as a dangling symlink; its parent must already exist. The new output is private (mode 0700). Do not reuse an existing project or output. `--function` is repeatable and selects an exact function name or entry address, not a substring or containing address. Missing/ambiguous selectors fail; duplicate selectors and duplicate non-repeatable value options are rejected. Without selectors, the first bounded functions in address order are exported, **not full-program coverage**.
 
-```text
-□ 从字符串 / 导入 API 反查
-□ Decompile 窗口还原算法
-□ 重命名函数/变量；写 Plate comment
-□ 需要动态时交接 Frida/GDB（reverse-engineering 动态章）
-```
+Launcher discovery, in order:
 
-### 3. Headless（批量）
+1. `--launcher PATH` (explicit trusted executable)
+2. `GHIDRA_HEADLESS`
+3. `ghidra-headless`, then `analyzeHeadless` on `PATH`
+4. `GHIDRA_HOME/support/analyzeHeadless`, with installation metadata checked
 
-```bash
-# 示例：analyzeHeadless 路径因安装而异，MUST 从 tool-index 取
-analyzeHeadless /path/to/project Proj -import sample.bin -postScript ExportDecomp.py
-```
+An explicitly supplied invalid launcher fails rather than falling back. No hard-coded install paths. The wrapper uses `shell=False` argv, a fresh project, `-readOnly`, the actual bundled script directory, and separate logs. It never requests overwrite/process, project renames, binary patches, networking, or sample execution.
 
-### 4. MCP（若已配置）
+## Results and bounds
 
-```text
-□ 确认 ghidra MCP 端口（常见 8765，以 tool-index 为准）
-□ 用 MCP 工具拉反编译 / xrefs，禁止猜端口
-```
+- `analysis.json`: sample SHA256; Ghidra/program/language identity; analysis-timeout flag; requested selectors and limits; function name/address, C or failure, and entry-point xrefs (`from_address`, reference `type`, containing `caller` or null).
+- `functions_truncated` and per-function `xrefs_truncated` explicitly disclose limits. Entry-point references include data references; they are **not** all references into the function body, a complete call graph, or proof of runtime reachability.
+- `request.json`, `console.log`, `headless.log`, `script.log`, and a fresh project workspace are retained for diagnosis. Read-only import discards program changes; no reusable saved project is promised.
+- Default/max: functions 20/1000, xrefs per function 100/10000, analysis seconds 120/3600, per-function seconds 30/300, overall wall seconds 300/7200. All are positive integers. C is capped at 100000 characters per function; an oversized result fails rather than silently truncating C. Analysis limits are per imported file; wall time also includes startup/import/export.
+- Overall timeout kills the POSIX process group, retains diagnostics, and returns 124. Other failures return nonzero. A zero launcher exit alone is insufficient: missing/malformed/empty/incomplete reports, unmatched selectors, analysis timeout, any failed decompilation, wrong digest, or invalid structure fail. Intentional scoped function/xref truncation is allowed and reported in JSON and the console summary.
 
-## 工具链
+Treat C, logs, strings and names as potentially sensitive and untrusted sample-derived content. The console summary does not print decompiled source. Keep outputs local and review before sharing.
 
-| 工具 | 用途 | 自举 |
-|------|------|------|
-| Ghidra | 反编译主工具 | 手动 release / 包管理器 |
-| ghidra-mcp | AI 桥 | bootstrap 能力名 `ghidra-mcp` |
-| ghidriff | 补丁差分 | 见 `patch-diff-exploit` |
+## Limits and safety
 
-## 参考
+Static import is **not a sandbox**: Ghidra parsers, analyzers, native decompiler and installed extensions execute trusted tool code on potentially hostile input. Read-only does not isolate the parser, prevent all cache writes or enforce offline networking. Use a separately provisioned low-privilege offline sandbox for hostile samples; this wrapper does not create one. A launcher supplied by the user is executable code and must be trusted. Descendants that deliberately escape the process group are outside the cleanup guarantee.
 
-- `references/ghidra-cheatsheet.md`
-- `../ida-reverse/` `../radare2/` `../binary-diff/`
+This wrapper targets POSIX and requires Python 3.9 or newer. Native Windows and `.bat`/`.cmd`/`.exe` launchers are explicitly unsupported. Linux is exercised by the offline integration test; macOS and other POSIX platforms are untested. Ghidra may impose additional filesystem-name constraints (for example, single quotes in project/output paths are rejected by its project API); argv quoting cannot override those rules. Spaces are tested. Installation directories used as script paths must also obey Ghidra's script-path syntax.
 
-## 路由上下文
+Java avoids the different Jython/PyGhidra runtime and package assumptions. The exporter uses Ghidra's bundled Gson, not an added dependency. Compatibility with every Ghidra release is not claimed; run the included integration test against your installed release.
 
-**上游**: MASTER R22  
-**下游**: 动态验证 → Frida/GDB；利用 → `pwn-chain`  
-**同级**: `ida-reverse`（商业深挖）
+## Official MCP policy
 
-## 任务完成自检
+Only consider an MCP server whose source and maintenance are verified official. A bounded check of the official Ghidra README and tracked tree at `2ea69c678b1f8f44352e6a8f6d05633a906f2064` identified no official MCP server. This is not a universal absence claim. This Skill uses headless only: no third-party MCP, guessed endpoint/port, automatic bridge installation or bootstrap.
 
-- [ ] 是否基于真实 Ghidra/tool-index 路径？
-- [ ] 是否标注函数地址与重命名？
-- [ ] 是否有可复现步骤？
-- [ ] Checklist / journal？
+See [usage and official sources](references/usage.md) and [GUI/API quick reference](references/ghidra-cheatsheet.md).
+
+## Completion check
+
+- Authorized sample/action/output and full-repository scope gates satisfied where applicable?
+- Wrapper returned zero and report digest/selection/status/identity reviewed?
+- Coverage and truncation disclosed; caller xrefs distinguished from data references?
+- Diagnostics retained privately and no sample execution or input modification?
+- Next dynamic-analysis action separately authorized rather than inferred?

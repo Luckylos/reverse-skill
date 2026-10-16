@@ -43,6 +43,22 @@
 <br/>
 
 
+## Standalone Ghidra Skill (fork addition)
+
+The self-contained [`ghidra-reverse`](skills/ghidra-reverse/SKILL.md) entry uses official Ghidra headless/Java APIs with explicit authorization, fresh private outputs, bounded decompilation and entry-point xrefs. It does not install tools or connect to third-party MCP servers.
+
+For an independent magpie installation, import this **subdirectory URL** from the App Library:
+
+```text
+https://github.com/Luckylos/reverse-skill/tree/main/skills/ghidra-reverse
+```
+
+Use the subdirectory rather than the repository root: magpie candidate discovery stops descending when it finds the parent `skills/SKILL.md`. This guidance is checked against official magpie source; it is not a claim that installation was performed in your App.
+
+On Pi, after installation, use `/skill:ghidra-reverse` with your task. Reading the Skill is not permission to execute it: approve the sample, exact command and output effects first. Full-repository authorization gates remain binding when using the full router.
+
+See [usage, test requirements and platform limits](skills/ghidra-reverse/references/usage.md). The wrapper targets POSIX; native Windows is unsupported and macOS is untested.
+
 <a id="about"></a>
 
 ## About
