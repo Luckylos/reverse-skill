@@ -1,11 +1,15 @@
 ---
 name: reverse-skill-router
-description: Use the reverse-skill repository from Codex for authorized reverse engineering, security analysis, CTF, and defensive testing tasks. Requires the reverse-skill repository to be available as the current workspace or an explicitly supplied local path.
+description: Use the reverse-skill repository from your coding agent for authorized reverse engineering, security analysis, CTF, and defensive testing tasks. Requires the reverse-skill repository to be available as the current workspace or an explicitly supplied local path.
 ---
 
-# Reverse Skill Codex adapter
+# Reverse Skill repository adapter
 
-This plugin is an optional Codex entry point. The repository remains the canonical, client-neutral implementation.
+## Runtime preflight
+
+Reuse an existing repository checkout before asking the user to clone another. A user-provided path or the optional environment variable `REVERSE_SKILL_REPO` may identify it; verify its `RULES.md` and router files before use. If no checkout can be found, ask for a path. This does not grant target authorization, configure MCP servers, or install tools.
+
+This plugin is an optional agent entry point. The repository remains the canonical, client-neutral implementation.
 
 When the current workspace is the `reverse-skill` repository:
 
@@ -15,6 +19,6 @@ When the current workspace is the `reverse-skill` repository:
 4. Open the selected `skills/<PRIMARY>/SKILL.md` and follow its task-specific instructions.
 5. Resolve tools only through the generated `skills/tool-index.md`; do not register MCP servers or install tools unless the user requested that action.
 
-If the repository is not the current workspace and no local repository path was supplied, explain that this adapter does not bundle a second copy of the router. Ask the user to open or clone `https://github.com/zhaoxuya520/reverse-skill` and then continue from its `RULES.md`.
+If the repository is not the current workspace and no verified local repository path can be found, explain that this adapter does not bundle a second copy of the router. Ask the user to open or clone `https://github.com/zhaoxuya520/reverse-skill` and then continue from its `RULES.md`.
 
 Do not treat the presence of this plugin, a target name, or a sample path as authorization. Authorization comes from the repository's scope contract.
